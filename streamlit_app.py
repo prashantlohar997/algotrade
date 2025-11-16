@@ -28,6 +28,8 @@ if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 if 'last_update' not in st.session_state:
     st.session_state.last_update = None
+if 'data_error' not in st.session_state:
+    st.session_state.data_error = None
 
 class ETHTradingBot:
     def __init__(self):
@@ -37,7 +39,7 @@ class ETHTradingBot:
         self.take_profit_percent = 2.5
     
     def get_eth_data(self, timeframe='1h', limit=100):
-        """Fetch ETH/USD data from Binance"""
+        """Fetch ETH/USD data from Binance with error handling"""
         try:
             url = "https://api.binance.com/api/v3/klines"
             params = {
@@ -46,8 +48,13 @@ class ETHTradingBot:
                 'limit': limit
             }
             
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
             data = response.json()
+            
+            if not data:
+                st.session_state.data_error = "No data received from API"
+                return None
             
             df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -55,50 +62,108 @@ class ETHTradingBot:
                 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
             ])
             
+            # Convert types
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df.dropna()
+            
+            if len(df) == 0:
+                st.session_state.data_error = "No valid data after cleaning"
+                return None
+                
             return df
             
         except Exception as e:
-            st.error(f"Error fetching data: {e}")
+            st.session_state.data_error = f"Error fetching data: {str(e)}"
             return None
     
     def calculate_indicators(self, df):
-        """Calculate technical indicators"""
-        df = df.copy()
-        df['ema_9'] = ta.trend.EMAIndicator(df['close'], window=self.ema_period).ema_indicator()
-        current_ema = df['ema_9'].iloc[-1]
-        resistance_zone = (current_ema, current_ema + self.resistance_buffer)
-        return df, resistance_zone
+        """Calculate technical indicators with error handling"""
+        try:
+            df = df.copy()
+            
+            # Ensure we have enough data for EMA
+            if len(df) < self.ema_period:
+                return None, (0, 0)
+            
+            df['ema_9'] = ta.trend.EMAIndicator(df['close'], window=self.ema_period).ema_indicator()
+            
+            # Get the last valid EMA value
+            current_ema = df['ema_9'].dropna().iloc[-1] if not df['ema_9'].isna().all() else df['close'].iloc[-1]
+            resistance_zone = (current_ema, current_ema + self.resistance_buffer)
+            
+            return df, resistance_zone
+            
+        except Exception as e:
+            st.session_state.data_error = f"Error calculating indicators: {str(e)}"
+            return None, (0, 0)
     
     def analyze_market(self, df):
-        """Analyze market and generate signals"""
-        current_price = df['close'].iloc[-1]
-        df, resistance_zone = self.calculate_indicators(df)
-        
-        trend = "BEARISH" if current_price < df['ema_9'].iloc[-1] else "BULLISH"
-        signal = "HOLD"
-        reason = "Waiting for setup"
-        
-        if trend == "BEARISH" and resistance_zone[0] <= current_price <= resistance_zone[1]:
-            signal = "SELL"
-            reason = f"Price in resistance zone ({resistance_zone[0]:.2f}-{resistance_zone[1]:.2f}) during downtrend"
-        
-        return {
-            'signal': signal,
-            'trend': trend,
-            'current_price': current_price,
-            'ema_9': df['ema_9'].iloc[-1],
-            'resistance_zone': resistance_zone,
-            'reason': reason,
-            'timestamp': datetime.now()
-        }
+        """Analyze market and generate signals with error handling"""
+        try:
+            if df is None or len(df) == 0:
+                return {
+                    'signal': "HOLD",
+                    'trend': "UNKNOWN",
+                    'current_price': 0,
+                    'ema_9': 0,
+                    'resistance_zone': (0, 0),
+                    'reason': "No data available",
+                    'timestamp': datetime.now()
+                }
+            
+            # Safe price access
+            current_price = df['close'].iloc[-1] if len(df) > 0 else 0
+            
+            df_with_indicators, resistance_zone = self.calculate_indicators(df)
+            
+            if df_with_indicators is None:
+                return {
+                    'signal': "HOLD",
+                    'trend': "UNKNOWN", 
+                    'current_price': current_price,
+                    'ema_9': 0,
+                    'resistance_zone': (0, 0),
+                    'reason': "Insufficient data for analysis",
+                    'timestamp': datetime.now()
+                }
+            
+            current_ema = df_with_indicators['ema_9'].iloc[-1]
+            trend = "BEARISH" if current_price < current_ema else "BULLISH"
+            signal = "HOLD"
+            reason = "Waiting for setup"
+            
+            if trend == "BEARISH" and resistance_zone[0] <= current_price <= resistance_zone[1]:
+                signal = "SELL"
+                reason = f"Price in resistance zone ({resistance_zone[0]:.2f}-{resistance_zone[1]:.2f}) during downtrend"
+            
+            return {
+                'signal': signal,
+                'trend': trend,
+                'current_price': current_price,
+                'ema_9': current_ema,
+                'resistance_zone': resistance_zone,
+                'reason': reason,
+                'timestamp': datetime.now()
+            }
+            
+        except Exception as e:
+            st.session_state.data_error = f"Analysis error: {str(e)}"
+            return {
+                'signal': "HOLD",
+                'trend': "ERROR",
+                'current_price': 0,
+                'ema_9': 0,
+                'resistance_zone': (0, 0),
+                'reason': f"Analysis failed: {str(e)}",
+                'timestamp': datetime.now()
+            }
     
     def execute_trade(self, analysis, account_balance=1000):
         """Execute trade based on analysis"""
-        if analysis['signal'] == "HOLD":
+        if analysis['signal'] == "HOLD" or analysis['current_price'] == 0:
             return None
         
         current_price = analysis['current_price']
@@ -144,6 +209,7 @@ col1, col2 = st.sidebar.columns(2)
 with col1:
     if st.button("🚀 Start Bot", disabled=st.session_state.bot_running):
         st.session_state.bot_running = True
+        st.session_state.data_error = None
         st.success("Bot started!")
 
 with col2:
@@ -158,13 +224,18 @@ account_balance = st.sidebar.number_input("Account Balance ($)", min_value=100, 
 # Main content area
 col1, col2 = st.columns([2, 1])
 
+# Display errors if any
+if st.session_state.data_error:
+    st.error(f"Data Error: {st.session_state.data_error}")
+    st.info("Trying to fetch data again...")
+
 with col1:
     st.header("📊 Market Analysis")
     
     # Fetch and display current data
     df = bot.get_eth_data()
     
-    if df is not None:
+    if df is not None and len(df) > 0:
         analysis = bot.analyze_market(df)
         
         # Display current status
@@ -189,30 +260,31 @@ with col1:
             name="ETH/USD"
         ))
         
-        # Add EMA
-        fig.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['ema_9'],
-            line=dict(color='orange', width=2),
-            name=f"EMA {ema_period}"
-        ))
-        
-        # Add resistance zone
-        resistance_low = analysis['resistance_zone'][0]
-        resistance_high = analysis['resistance_zone'][1]
-        fig.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=[resistance_low] * len(df),
-            line=dict(color='red', width=2, dash='dash'),
-            name="Resistance Zone"
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=[resistance_high] * len(df),
-            line=dict(color='red', width=2, dash='dash'),
-            showlegend=False
-        ))
+        # Add EMA if available
+        if 'ema_9' in df.columns and not df['ema_9'].isna().all():
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=df['ema_9'],
+                line=dict(color='orange', width=2),
+                name=f"EMA {ema_period}"
+            ))
+            
+            # Add resistance zone
+            resistance_low = analysis['resistance_zone'][0]
+            resistance_high = analysis['resistance_zone'][1]
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=[resistance_low] * len(df),
+                line=dict(color='red', width=2, dash='dash'),
+                name="Resistance Zone"
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=[resistance_high] * len(df),
+                line=dict(color='red', width=2, dash='dash'),
+                showlegend=False
+            ))
         
         fig.update_layout(
             title="ETH/USD Price Chart with EMA & Resistance",
@@ -222,43 +294,49 @@ with col1:
         )
         
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No data available. Please check your internet connection.")
+        st.info("The app will automatically retry...")
 
 with col2:
     st.header("📈 Trading Signals")
     
-    # Display analysis results
-    st.subheader("Current Analysis")
-    st.write(f"**Trend:** {analysis['trend']}")
-    st.write(f"**Signal:** {analysis['signal']}")
-    st.write(f"**EMA {ema_period}:** ${analysis['ema_9']:.2f}")
-    st.write(f"**Resistance Zone:** ${analysis['resistance_zone'][0]:.2f} - ${analysis['resistance_zone'][1]:.2f}")
-    st.write(f"**Reason:** {analysis['reason']}")
-    
-    # Manual trade execution
-    st.subheader("Manual Control")
-    if st.button("🔄 Check Signal", key="manual_check"):
-        df = bot.get_eth_data()
-        if df is not None:
-            analysis = bot.analyze_market(df)
-            trade = bot.execute_trade(analysis, account_balance)
-            
-            if trade:
-                st.session_state.trade_history.append(trade)
-                st.success(f"Trade Executed: {trade['action']} at ${trade['entry_price']:.2f}")
-            else:
-                st.info("No trade signal at this time")
-    
-    if st.button("📥 Execute SELL", type="primary", disabled=analysis['signal'] != 'SELL'):
-        df = bot.get_eth_data()
-        if df is not None:
-            analysis = bot.analyze_market(df)
-            trade = bot.execute_trade(analysis, account_balance)
-            
-            if trade:
-                st.session_state.trade_history.append(trade)
-                st.success(f"SELL Order Executed at ${trade['entry_price']:.2f}")
-                st.write(f"Stop Loss: ${trade['stop_loss']:.2f}")
-                st.write(f"Take Profit: ${trade['take_profit']:.2f}")
+    if df is not None and len(df) > 0:
+        # Display analysis results
+        st.subheader("Current Analysis")
+        st.write(f"**Trend:** {analysis['trend']}")
+        st.write(f"**Signal:** {analysis['signal']}")
+        st.write(f"**EMA {ema_period}:** ${analysis['ema_9']:.2f}")
+        st.write(f"**Resistance Zone:** ${analysis['resistance_zone'][0]:.2f} - ${analysis['resistance_zone'][1]:.2f}")
+        st.write(f"**Reason:** {analysis['reason']}")
+        
+        # Manual trade execution
+        st.subheader("Manual Control")
+        if st.button("🔄 Check Signal", key="manual_check"):
+            df = bot.get_eth_data()
+            if df is not None and len(df) > 0:
+                analysis = bot.analyze_market(df)
+                trade = bot.execute_trade(analysis, account_balance)
+                
+                if trade:
+                    st.session_state.trade_history.append(trade)
+                    st.success(f"Trade Executed: {trade['action']} at ${trade['entry_price']:.2f}")
+                else:
+                    st.info("No trade signal at this time")
+        
+        if st.button("📥 Execute SELL", type="primary", disabled=analysis['signal'] != 'SELL'):
+            df = bot.get_eth_data()
+            if df is not None and len(df) > 0:
+                analysis = bot.analyze_market(df)
+                trade = bot.execute_trade(analysis, account_balance)
+                
+                if trade:
+                    st.session_state.trade_history.append(trade)
+                    st.success(f"SELL Order Executed at ${trade['entry_price']:.2f}")
+                    st.write(f"Stop Loss: ${trade['stop_loss']:.2f}")
+                    st.write(f"Take Profit: ${trade['take_profit']:.2f}")
+    else:
+        st.warning("Waiting for market data...")
 
 # Trade History
 st.header("📋 Trade History")
@@ -273,21 +351,9 @@ st.header("🤖 Auto-Trading Mode")
 if st.session_state.bot_running:
     st.warning("Auto-trading is ACTIVE - Bot will check signals every 30 seconds")
     
-    # Auto-trading logic
+    # Auto-refresh
     if st.session_state.last_update is None or (datetime.now() - st.session_state.last_update).seconds >= 30:
-        df = bot.get_eth_data()
-        if df is not None:
-            analysis = bot.analyze_market(df)
-            trade = bot.execute_trade(analysis, account_balance)
-            
-            if trade:
-                st.session_state.trade_history.append(trade)
-                st.success(f"AUTO-TRADE: {trade['action']} at ${trade['entry_price']:.2f}")
-            
-            st.session_state.last_update = datetime.now()
-            
-        # Refresh the page to update
-        time.sleep(1)
+        st.session_state.last_update = datetime.now()
         st.rerun()
 else:
     st.info("Auto-trading is INACTIVE - Click 'Start Bot' to begin")
@@ -317,3 +383,8 @@ with st.expander("📚 Strategy Explanation"):
 # Footer
 st.markdown("---")
 st.markdown("⚠️ **Disclaimer:** This is for educational purposes only. Trade at your own risk.")
+
+# Auto-refresh for live data
+if st.session_state.bot_running:
+    time.sleep(5)
+    st.rerun()
